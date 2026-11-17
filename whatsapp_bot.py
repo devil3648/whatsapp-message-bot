@@ -1,10 +1,15 @@
 import re
+import json
+import uuid
 import webbrowser
 import tkinter as tk
+from pathlib import Path
+from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
 from urllib.parse import quote
 
 MAX_REPEATS = 100
+SCHEDULE_FILE = Path(__file__).with_name("scheduled_messages.json")
 
 
 def normalize_number(raw):
@@ -22,6 +27,42 @@ def build_whatsapp_url(number, text):
     return f"https://wa.me/{number}?text={quote(text, safe='')}"
 
 
+def parse_schedule(date_text, time_text):
+    try:
+        return datetime.strptime(f"{date_text.strip()} {time_text.strip()}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        raise ValueError("Use YYYY-MM-DD for the date and HH:MM (24-hour) for the time.")
+
+
+def load_jobs(path=SCHEDULE_FILE):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    jobs = []
+    for job in data:
+        if not isinstance(job, dict):
+            continue
+        if not all(key in job for key in ("id", "number", "text", "due_at")):
+            continue
+        try:
+            datetime.fromisoformat(job["due_at"])
+        except (TypeError, ValueError):
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def save_jobs(jobs, path=SCHEDULE_FILE):
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(jobs, handle, indent=2)
+
+
 class WhatsAppBotApp:
     def __init__(self, root):
         self.root = root
@@ -29,6 +70,21 @@ class WhatsAppBotApp:
         self.number = None
         self.message = None
         self.combined = None
+        self.manager_tree = None
+        self.startup_notice = None
+
+        self.jobs = load_jobs()
+        now = datetime.now()
+        expired = [job for job in self.jobs if datetime.fromisoformat(job["due_at"]) <= now]
+        if expired:
+            self.jobs = [job for job in self.jobs if job not in expired]
+            try:
+                save_jobs(self.jobs)
+            except OSError:
+                pass
+            self.startup_notice = (
+                f"Removed {len(expired)} scheduled message(s) that expired while the app was closed."
+            )
 
         root.title("WhatsApp Message Bot")
         root.geometry("640x640")
@@ -62,8 +118,9 @@ class WhatsAppBotApp:
         hint = ttk.Label(
             bot_frame,
             text="Click the bot to start a new message.\n\n"
-            "It will ask for a number, the message,\n"
-            "and how many times to repeat it.",
+            "It asks for a number, the message,\n"
+            "and how many times to repeat it.\n"
+            "You can also schedule it for later.",
             style="Hint.TLabel",
             justify="left",
         )
@@ -137,8 +194,20 @@ class WhatsAppBotApp:
         )
         self.send_wa_button.pack(side="left")
 
+        self.schedule_button = ttk.Button(
+            actions, text="Schedule...", command=self.open_schedule_dialog, state="disabled"
+        )
+        self.schedule_button.pack(side="left", padx=(8, 0))
+
+        self.scheduled_button = ttk.Button(
+            actions, text=f"Scheduled: {len(self.jobs)}", command=self.open_schedule_manager
+        )
+        self.scheduled_button.pack(side="left", padx=(8, 0))
+
         restart = ttk.Button(actions, text="Start Over", command=self.start_conversation)
         restart.pack(side="right")
+
+        self.root.after(2000, self.check_due_jobs)
 
     def draw_bot(self):
         c = self.bot_canvas
@@ -177,6 +246,7 @@ class WhatsAppBotApp:
         self.preview_text.config(state="disabled")
 
         self.send_wa_button.config(state="disabled")
+        self.schedule_button.config(state="disabled")
         self.entry.config(state="normal")
         self.send_button.config(state="normal")
         self.input_var.set("")
@@ -185,6 +255,9 @@ class WhatsAppBotApp:
             "Hi! Enter the WhatsApp number with country code (digits only, "
             "for example 919876543210):"
         )
+        if self.startup_notice:
+            self.append_bot(self.startup_notice)
+            self.startup_notice = None
         self.entry.focus_set()
 
     def on_send(self):
@@ -236,6 +309,7 @@ class WhatsAppBotApp:
         self.preview_text.insert("1.0", self.combined)
         self.preview_text.config(state="disabled")
         self.send_wa_button.config(state="normal")
+        self.schedule_button.config(state="normal")
         self.entry.config(state="disabled")
         self.send_button.config(state="disabled")
 
@@ -251,6 +325,198 @@ class WhatsAppBotApp:
             self.append_bot("WhatsApp opened with your number and combined message. Press Send there.")
         except Exception as exc:
             messagebox.showerror("Could not open WhatsApp", str(exc))
+
+    def persist_jobs(self):
+        try:
+            save_jobs(self.jobs)
+        except OSError as exc:
+            messagebox.showerror("Could not save schedule", str(exc))
+        self.update_schedule_label()
+        self.refresh_manager()
+
+    def update_schedule_label(self):
+        self.scheduled_button.config(text=f"Scheduled: {len(self.jobs)}")
+
+    def open_schedule_dialog(self):
+        if not self.number or not self.combined:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Schedule message")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        date_var = tk.StringVar(value=datetime.now().date().isoformat())
+        time_var = tk.StringVar(value=(datetime.now() + timedelta(minutes=5)).strftime("%H:%M"))
+
+        ttk.Label(frame, text=f"To: {self.number}").pack(anchor="w")
+        preview = self.combined.splitlines()[0]
+        if len(preview) > 48:
+            preview = preview[:45] + "..."
+        ttk.Label(frame, text=f"Message: {preview}").pack(anchor="w", pady=(2, 10))
+
+        fields = ttk.Frame(frame)
+        fields.pack(fill="x")
+        ttk.Label(fields, text="Date (YYYY-MM-DD):").grid(row=0, column=0, sticky="w", pady=3)
+        date_entry = ttk.Entry(fields, textvariable=date_var, width=16)
+        date_entry.grid(row=0, column=1, sticky="w", pady=3, padx=(8, 0))
+        ttk.Label(fields, text="Time (HH:MM):").grid(row=1, column=0, sticky="w", pady=3)
+        time_entry = ttk.Entry(fields, textvariable=time_var, width=16)
+        time_entry.grid(row=1, column=1, sticky="w", pady=3, padx=(8, 0))
+        date_entry.focus_set()
+
+        def confirm():
+            try:
+                due = parse_schedule(date_var.get(), time_var.get())
+            except ValueError as exc:
+                messagebox.showerror("Invalid date or time", str(exc), parent=dialog)
+                return
+            if due <= datetime.now():
+                messagebox.showerror(
+                    "Invalid date or time", "Choose a time in the future.", parent=dialog
+                )
+                return
+            self.jobs.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "number": self.number,
+                    "text": self.combined,
+                    "due_at": due.isoformat(),
+                    "created_at": datetime.now().isoformat(),
+                }
+            )
+            self.persist_jobs()
+            self.append_bot(f"Scheduled for {due.strftime('%Y-%m-%d %H:%M')}.")
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(buttons, text="Schedule", command=confirm).pack(side="right", padx=(0, 8))
+
+    def open_schedule_manager(self):
+        if self.manager_tree is not None and self.manager_tree.winfo_exists():
+            self.manager_tree.winfo_toplevel().lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Scheduled messages")
+        window.geometry("600x320")
+        window.minsize(500, 240)
+
+        body = ttk.Frame(window)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+
+        tree = ttk.Treeview(
+            body, columns=("when", "number", "message"), show="headings", height=8
+        )
+        tree.heading("when", text="When")
+        tree.heading("number", text="Number")
+        tree.heading("message", text="Message")
+        tree.column("when", width=150, anchor="w")
+        tree.column("number", width=130, anchor="w")
+        tree.column("message", width=280, anchor="w")
+        scroll = ttk.Scrollbar(body, command=tree.yview)
+        tree.config(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.manager_tree = tree
+        self.refresh_manager()
+
+        buttons = ttk.Frame(window)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(
+            buttons, text="Cancel selected", command=lambda: self.cancel_selected_jobs(tree)
+        ).pack(side="left")
+        ttk.Button(
+            buttons, text="Close", command=lambda: self.close_schedule_manager(window)
+        ).pack(side="right")
+        window.protocol("WM_DELETE_WINDOW", lambda: self.close_schedule_manager(window))
+
+    def close_schedule_manager(self, window):
+        self.manager_tree = None
+        window.destroy()
+
+    def refresh_manager(self):
+        tree = self.manager_tree
+        if tree is None or not tree.winfo_exists():
+            self.manager_tree = None
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        for job in sorted(self.jobs, key=lambda entry: entry["due_at"]):
+            due = datetime.fromisoformat(job["due_at"])
+            preview = job["text"].splitlines()[0] if job["text"] else ""
+            if len(preview) > 48:
+                preview = preview[:45] + "..."
+            tree.insert(
+                "",
+                "end",
+                iid=job["id"],
+                values=(due.strftime("%Y-%m-%d %H:%M"), job["number"], preview),
+            )
+
+    def cancel_selected_jobs(self, tree):
+        selected = list(tree.selection())
+        if not selected:
+            return
+        if not messagebox.askyesno(
+            "Cancel scheduled messages",
+            f"Remove {len(selected)} scheduled message(s)?",
+            parent=tree.winfo_toplevel(),
+        ):
+            return
+        self.jobs = [job for job in self.jobs if job["id"] not in selected]
+        self.persist_jobs()
+        self.append_bot(f"Cancelled {len(selected)} scheduled message(s).")
+
+    def check_due_jobs(self):
+        now = datetime.now()
+        due = [job for job in self.jobs if datetime.fromisoformat(job["due_at"]) <= now]
+        if due:
+            self.jobs = [job for job in self.jobs if job not in due]
+            self.persist_jobs()
+            for job in due:
+                self.fire_job(job)
+        self.root.after(2000, self.check_due_jobs)
+
+    def fire_job(self, job):
+        self.show_notification(job)
+        try:
+            webbrowser.open(build_whatsapp_url(job["number"], job["text"]))
+            self.append_bot(f"Scheduled message to {job['number']} is due. WhatsApp opened.")
+        except Exception as exc:
+            self.append_bot(
+                f"Scheduled message to {job['number']} is due, "
+                f"but WhatsApp could not be opened: {exc}"
+            )
+
+    def show_notification(self, job):
+        toast = tk.Toplevel(self.root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        width, height = 380, 115
+        x = self.root.winfo_screenwidth() - width - 20
+        y = self.root.winfo_screenheight() - height - 60
+        toast.geometry(f"{width}x{height}+{x}+{y}")
+
+        frame = ttk.Frame(toast, relief="solid", borderwidth=1, padding=10)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame, text="Scheduled message due", font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w")
+        preview = job["text"].splitlines()[0] if job["text"] else ""
+        if len(preview) > 52:
+            preview = preview[:49] + "..."
+        ttk.Label(frame, text=f"To: {job['number']}\n{preview}", wraplength=350).pack(
+            anchor="w", pady=(4, 0)
+        )
+        ttk.Button(frame, text="Dismiss", command=toast.destroy).pack(anchor="e", pady=(6, 0))
+        toast.after(15000, toast.destroy)
 
 
 def main():
